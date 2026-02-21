@@ -1,0 +1,8 @@
+[
+  {"task_id":"T1","pickup":[1,1],"drop":[10,10],"priority":1},
+  {"task_id":"T2","pickup":[2,10],"drop":[9,2],"priority":2},
+  {"task_id":"T3","pickup":[10,1],"drop":[1,10],"priority":1},
+  {"task_id":"T4","pickup":[3,2],"drop":[11,9],"priority":3},
+  {"task_id":"T5","pickup":[9,10],"drop":[0,6],"priority":2},
+  {"task_id":"T6","pickup":[6,1],"drop":[2,11],"priority":1}
+]

@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>NeuroSwarm-X | Digital Twin Dashboard</title>
+  <style>
+    body { margin:0; font-family: Arial; background:#070c1a; color:#fff; }
+    .wrap { display:flex; height:100vh; }
+    .left, .right { width:260px; padding:16px; background:#060a14; border-right:1px solid rgba(255,255,255,0.06); overflow:auto; }
+    .right { width:340px; border-right:none; border-left:1px solid rgba(255,255,255,0.06); }
+    .mid { flex:1; display:flex; flex-direction:column; padding:14px; }
+
+    .btn { width:100%; padding:12px; margin:8px 0; border:none; border-radius:10px; cursor:pointer;
+      background:#0f1b3e; color:white; font-size:15px; }
+    .btn:hover { background:#182c61; }
+
+    .card { background:#0b1230; border-radius:14px; padding:12px; margin:10px 0;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset; }
+    .title { font-size:18px; font-weight:bold; margin-bottom:8px; }
+
+    canvas { background:#07122c; border-radius:18px; box-shadow:0 0 0 1px rgba(255,255,255,0.06) inset; }
+    .logbox { height:80vh; overflow:auto; font-size:13px; line-height:1.35; }
+    .tag { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; margin-left:8px; }
+    .pid { background:#2366ff; }
+    .mpc { background:#ff9330; }
+
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+    .smallChart { height:70px; width:100%; background:#07122c; border-radius:12px; }
+    .taskitem { font-size:13px; padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.06); }
+    .muted { opacity:0.75; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <!-- LEFT PANEL -->
+    <div class="left">
+      <div class="title">NeuroSwarm-X</div>
+
+      <button class="btn" onclick="api('/start')">▶ Start</button>
+      <button class="btn" onclick="api('/stop')">⏸ Stop</button>
+      <button class="btn" onclick="api('/toggle_disturb')">⚡ Toggle Disturbances</button>
+      <button class="btn" onclick="api('/add_task')">➕ Add Random Task</button>
+
+      <div class="card">
+        <div class="title">Fleet KPIs</div>
+        <div id="fleetKpis" class="muted">Waiting...</div>
+      </div>
+
+      <div class="card">
+        <div class="title">AGVs</div>
+        <div id="agvList" class="muted">Waiting...</div>
+      </div>
+
+      <div class="card">
+        <div class="title">Tasks Progress</div>
+        <div id="taskList" class="muted">Waiting...</div>
+      </div>
+    </div>
+
+    <!-- CENTER -->
+    <div class="mid">
+      <div class="card">
+        <div class="title">Digital Twin Map (4 AGVs: 2 PID + 2 MPC)</div>
+        <canvas id="map" width="900" height="560"></canvas>
+      </div>
+
+      <div class="card grid">
+        <div>
+          <div class="title">RMSE PID vs MPC</div>
+          <canvas id="c_rmse" class="smallChart" width="420" height="70"></canvas>
+        </div>
+        <div>
+          <div class="title">Energy PID vs MPC</div>
+          <canvas id="c_energy" class="smallChart" width="420" height="70"></canvas>
+        </div>
+        <div>
+          <div class="title">Latency PID vs MPC</div>
+          <canvas id="c_lat" class="smallChart" width="420" height="70"></canvas>
+        </div>
+        <div>
+          <div class="title">Jerk PID vs MPC</div>
+          <canvas id="c_jerk" class="smallChart" width="420" height="70"></canvas>
+        </div>
+      </div>
+
+      <div class="card" id="compareBox">
+        <div class="title">MPC vs PID Live Comparison</div>
+        <div id="cmpText" class="muted">Waiting...</div>
+      </div>
+    </div>
+
+    <!-- RIGHT PANEL -->
+    <div class="right">
+      <div class="title">System Logs</div>
+      <div class="card logbox" id="logs"></div>
+    </div>
+  </div>
+
+<script>
+  const API = "http://127.0.0.1:8000";
+  let ws = null;
+
+  function api(path){
+    fetch(API+path, {method:"POST"}).catch(()=>{});
+  }
+
+  // ---------------------------
+  // Charts history (rolling)
+  // ---------------------------
+  const maxPts = 120;
+  let hist = {
+    rmse_pid:[], rmse_mpc:[],
+    energy_pid:[], energy_mpc:[],
+    lat_pid:[], lat_mpc:[],
+    jerk_pid:[], jerk_mpc:[]
+  };
+
+  function pushHist(k, v){
+    hist[k].push(v);
+    if(hist[k].length > maxPts) hist[k].shift();
+  }
+
+  function drawMiniChart(canvasId, pidArr, mpcArr, label){
+    const c = document.getElementById(canvasId);
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0,0,c.width,c.height);
+
+    // background grid
+    ctx.globalAlpha=0.22;
+    ctx.strokeStyle="white";
+    for(let i=0;i<6;i++){
+      ctx.beginPath();
+      ctx.moveTo(0, i*(c.height/5));
+      ctx.lineTo(c.width, i*(c.height/5));
+      ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+
+    // scale
+    const all = pidArr.concat(mpcArr);
+    let maxV = Math.max(1e-6, ...all);
+    let minV = Math.min(0, ...all);
+
+    function drawLine(arr, color){
+      if(arr.length<2) return;
+      ctx.strokeStyle=color;
+      ctx.lineWidth=2;
+      ctx.beginPath();
+      for(let i=0;i<arr.length;i++){
+        const x = (i/(maxPts-1))*c.width;
+        const y = c.height - ((arr[i]-minV)/(maxV-minV+1e-6))*c.height;
+        if(i===0) ctx.moveTo(x,y);
+        else ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    }
+
+    drawLine(pidArr, "#2366ff");
+    drawLine(mpcArr, "#ff9330");
+
+    // legend
+    ctx.fillStyle="#ffffff";
+    ctx.font="12px Arial";
+    ctx.fillText("PID", 10, 16);
+    ctx.fillText("MPC", 60, 16);
+    ctx.fillStyle="#2366ff"; ctx.fillRect(35,8,18,4);
+    ctx.fillStyle="#ff9330"; ctx.fillRect(85,8,18,4);
+  }
+
+  // ---------------------------
+  // Digital Twin map drawing
+  // ---------------------------
+  const map = document.getElementById("map");
+  const ctx = map.getContext("2d");
+  const GRID = 12;
+  const cell = 45;
+  const offsetX = 60;
+  const offsetY = 35;
+
+  function worldToCanvas(x,y){
+    return {
+      cx: offsetX + x*cell,
+      cy: offsetY + y*cell
+    };
+  }
+
+  function drawMap(state){
+    ctx.clearRect(0,0,map.width,map.height);
+
+    // draw grid
+    ctx.globalAlpha = 0.2;
+    ctx.strokeStyle = "#ffffff";
+    for(let i=0;i<=GRID;i++){
+      ctx.beginPath();
+      ctx.moveTo(offsetX, offsetY + i*cell);
+      ctx.lineTo(offsetX + GRID*cell, offsetY + i*cell);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(offsetX + i*cell, offsetY);
+      ctx.lineTo(offsetX + i*cell, offsetY + GRID*cell);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // draw obstacles
+    const grid = state.grid || [];
+    for(let r=0;r<GRID;r++){
+      for(let c=0;c<GRID;c++){
+        if(grid[r] && grid[r][c] === 1){
+          const p = worldToCanvas(c,r);
+          ctx.fillStyle="rgba(255,255,255,0.13)";
+          ctx.fillRect(p.cx, p.cy, cell, cell);
+        }
+      }
+    }
+
+    // ==================================================
+    // 🔴🟡🟢 TRAFFIC LIGHT VISUALIZATION (NEW – SAFE)
+    // ==================================================
+    (state.reservations || []).forEach(r => {
+      const cellCoord = r.cell;   // [x, y]
+      const owner = r.agv;
+
+      const p = worldToCanvas(cellCoord[0], cellCoord[1]);
+
+      ctx.globalAlpha = 0.6;
+
+      // 🔴 default: reserved by another AGV
+      ctx.fillStyle = "rgba(255,0,0,0.6)";
+
+      // 🟡 reserved by self (AGV currently in that cell)
+      const selfAgv = (state.agvs || []).find(a => a.id === owner);
+      if (
+        selfAgv &&
+        Math.round(selfAgv.x) === cellCoord[0] &&
+        Math.round(selfAgv.y) === cellCoord[1]
+      ){
+        ctx.fillStyle = "rgba(255,200,0,0.6)";
+      }
+
+      ctx.fillRect(
+        p.cx + 6,
+        p.cy + 6,
+        cell - 12,
+        cell - 12
+      );
+
+      ctx.globalAlpha = 1;
+    });
+
+
+    // draw tasks pickup/drop markers
+    (state.tasks || []).forEach(t=>{
+      const pu = worldToCanvas(t.pickup[0], t.pickup[1]);
+      const dr = worldToCanvas(t.drop[0], t.drop[1]);
+
+      ctx.fillStyle="rgba(0,255,180,0.75)";
+      ctx.fillRect(pu.cx+10, pu.cy+10, 10, 10);
+      ctx.fillStyle="rgba(255,80,80,0.75)";
+      ctx.fillRect(dr.cx+10, dr.cy+10, 10, 10);
+
+      ctx.fillStyle="white"; ctx.font="12px Arial";
+      ctx.fillText(t.id, pu.cx+22, pu.cy+18);
+    });
+
+    // draw AGV paths
+    (state.agvs || []).forEach(a=>{
+      if(!a.path || a.path.length<2) return;
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = (a.type==="PID") ? "#2366ff" : "#ff9330";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for(let i=0;i<a.path.length;i++){
+        const node = a.path[i];
+        const p = worldToCanvas(node[0], node[1]);
+        if(i===0) ctx.moveTo(p.cx + cell/2, p.cy + cell/2);
+        else ctx.lineTo(p.cx + cell/2, p.cy + cell/2);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    });
+
+    // draw AGVs
+    (state.agvs || []).forEach(a=>{
+      const p = worldToCanvas(a.x, a.y);
+
+      ctx.fillStyle = (a.type==="PID") ? "#2366ff" : "#ff9330";
+      ctx.beginPath();
+      ctx.arc(p.cx+cell/2, p.cy+cell/2, 14, 0, Math.PI*2);
+      ctx.fill();
+
+      ctx.fillStyle="white";
+      ctx.font="12px Arial";
+      ctx.fillText(a.id, p.cx+cell/2-18, p.cy+cell/2-20);
+
+      // task label
+      if(a.task){
+        ctx.globalAlpha=0.9;
+        ctx.fillStyle="rgba(255,255,255,0.16)";
+        ctx.fillRect(p.cx+cell/2-26, p.cy+cell/2+18, 72, 18);
+        ctx.fillStyle="white";
+        ctx.fillText(a.phase+" "+a.task, p.cx+cell/2-22, p.cy+cell/2+31);
+        ctx.globalAlpha=1;
+      }
+    });
+  }
+
+  // ---------------------------
+  // UI updates
+  // ---------------------------
+  function updateUI(state){
+    // Fleet KPI box
+    const k = state.kpis || {};
+    document.getElementById("fleetKpis").innerHTML =
+      `RMSE PID=${(k.rmse_pid||0).toFixed(3)} | MPC=${(k.rmse_mpc||0).toFixed(3)}<br>
+       Energy PID=${(k.energy_pid||0).toFixed(2)} | MPC=${(k.energy_mpc||0).toFixed(2)}<br>
+       Latency PID=${(k.lat_pid||0).toFixed(2)}ms | MPC=${(k.lat_mpc||0).toFixed(2)}ms<br>
+       Jerk PID=${(k.jerk_pid||0).toFixed(3)} | MPC=${(k.jerk_mpc||0).toFixed(3)}<br>
+       Disturbances: <b>${state.disturbances}</b>`;
+
+    // AGV list
+    const agvList = (state.agvs || []).map(a=>{
+      const tagClass = (a.type==="PID") ? "pid" : "mpc";
+      return `
+        <div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
+          <b>${a.id}</b>
+          <span class="tag ${tagClass}">${a.type}</span><br>
+          <span class="muted">Task:</span> ${a.task||"IDLE"} (${a.phase||"IDLE"})<br>
+          <span class="muted">RMSE:</span> ${a.rmse.toFixed(3)} | 
+          <span class="muted">Energy:</span> ${a.energy.toFixed(2)}<br>
+          <span class="muted">Lat:</span> ${a.lat.toFixed(2)}ms |
+          <span class="muted">Battery:</span> ${(a.battery*100).toFixed(0)}%
+        </div>
+      `;
+    }).join("");
+    document.getElementById("agvList").innerHTML = agvList || "No AGVs";
+
+    // Tasks progress
+    const tasks = (state.tasks || []).slice().reverse();
+    document.getElementById("taskList").innerHTML = tasks.map(t=>{
+      return `
+        <div class="taskitem">
+          <b>${t.id}</b> (P${t.priority})<br>
+          <span class="muted">Pickup:</span> ${t.pickup} → <span class="muted">Drop:</span> ${t.drop}<br>
+          <span class="muted">Status:</span> <b>${t.status}</b>
+          ${t.assigned_to ? `<br><span class="muted">AGV:</span> ${t.assigned_to}` : ""}
+        </div>
+      `;
+    }).join("") || "No tasks";
+
+    // logs
+    const logs = (state.logs || []).slice().reverse().map(x=>`<div>${x}</div>`).join("");
+    document.getElementById("logs").innerHTML = logs;
+
+    // charts
+    pushHist("rmse_pid", k.rmse_pid||0);
+    pushHist("rmse_mpc", k.rmse_mpc||0);
+    pushHist("energy_pid", k.energy_pid||0);
+    pushHist("energy_mpc", k.energy_mpc||0);
+    pushHist("lat_pid", k.lat_pid||0);
+    pushHist("lat_mpc", k.lat_mpc||0);
+    pushHist("jerk_pid", k.jerk_pid||0);
+    pushHist("jerk_mpc", k.jerk_mpc||0);
+
+    drawMiniChart("c_rmse", hist.rmse_pid, hist.rmse_mpc);
+    drawMiniChart("c_energy", hist.energy_pid, hist.energy_mpc);
+    drawMiniChart("c_lat", hist.lat_pid, hist.lat_mpc);
+    drawMiniChart("c_jerk", hist.jerk_pid, hist.jerk_mpc);
+
+    // comparison box
+    function pctBetter(pid, mpc){
+      if(pid < 1e-9) return 0;
+      return ((pid-mpc)/pid)*100;
+    }
+    const cmp =
+      `RMSE improvement: <b>${pctBetter(k.rmse_pid||0, k.rmse_mpc||0).toFixed(1)}%</b><br>
+       Energy saved: <b>${pctBetter(k.energy_pid||0, k.energy_mpc||0).toFixed(1)}%</b><br>
+       Latency change: <b>${pctBetter(k.lat_pid||0, k.lat_mpc||0).toFixed(1)}%</b><br>
+       Jerk reduction: <b>${pctBetter(k.jerk_pid||0, k.jerk_mpc||0).toFixed(1)}%</b>`;
+    document.getElementById("cmpText").innerHTML = cmp;
+
+    // redraw map
+    drawMap(state);
+  }
+
+  // ---------------------------
+  // WebSocket
+  // ---------------------------
+  function connect(){
+    ws = new WebSocket("ws://127.0.0.1:8000/ws");
+
+    ws.onopen = () => console.log("WS connected");
+    ws.onerror = () => console.log("WS error");
+
+    ws.onmessage = (event)=>{
+      const state = JSON.parse(event.data);
+      updateUI(state);
+    };
+
+    ws.onclose = ()=>{
+      console.log("WS closed, reconnecting...");
+      setTimeout(connect, 1000);
+    };
+  }
+
+  connect();
+</script>
+</body>
+</html>
